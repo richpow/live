@@ -10,19 +10,23 @@ const POLL_INTERVAL_SECONDS = Number(process.env.POLL_INTERVAL_SECONDS || 45);
 const OFFLINE_MISS_THRESHOLD = Number(process.env.OFFLINE_MISS_THRESHOLD || 2);
 const CONCURRENCY = Number(process.env.CONCURRENCY || 6);
 
-async function getCreators() {
+async function getCreatorsToMonitor() {
   const { rows } = await pool.query(`
-    select
+    select distinct
       creator_id,
-      tiktok_username,
-      coalesce(display_name, username) as display_name,
-      profile_image_url
-    from users
-    where tiktok_username is not null
-      and tiktok_username <> ''
+      "Creator's username" as tiktok_username
+    from fasttrack_daily
+    where "Creator's username" is not null
+      and "Creator's username" <> ''
       and creator_id is not null
+      and "Data period" >= current_date - interval '3 days'
+      and is_demo_data is not true
   `);
-  return rows;
+
+  return rows.map(r => ({
+    creator_id: r.creator_id,
+    tiktok_username: r.tiktok_username.replace(/^@/, "")
+  }));
 }
 
 async function isLive(username) {
@@ -36,22 +40,20 @@ async function markLive(c) {
     insert into live_now (
       creator_id,
       tiktok_username,
-      display_name,
-      profile_image_url,
       went_live_at,
       last_seen_live_at,
       last_check_at,
       miss_count,
       updated_at
     )
-    values ($1,$2,$3,$4,now(),now(),now(),0,now())
+    values ($1,$2,now(),now(),now(),0,now())
     on conflict (creator_id) do update set
       last_seen_live_at = now(),
       last_check_at = now(),
       miss_count = 0,
       updated_at = now()
     `,
-    [c.creator_id, c.tiktok_username, c.display_name, c.profile_image_url]
+    [c.creator_id, c.tiktok_username]
   );
 
   await pool.query(
@@ -86,17 +88,22 @@ async function markOffline(creator_id) {
   await pool.query(
     `
     update live_sessions
-    set ended_at = now(), updated_at = now()
-    where creator_id = $1 and ended_at is null
+    set ended_at = now(),
+        updated_at = now()
+    where creator_id = $1
+      and ended_at is null
     `,
     [creator_id]
   );
 
-  await pool.query(`delete from live_now where creator_id = $1`, [creator_id]);
+  await pool.query(
+    `delete from live_now where creator_id = $1`,
+    [creator_id]
+  );
 }
 
 async function poll() {
-  const creators = await getCreators();
+  const creators = await getCreatorsToMonitor();
   const limit = pLimit(CONCURRENCY);
 
   await Promise.allSettled(
@@ -104,13 +111,18 @@ async function poll() {
       limit(async () => {
         try {
           const live = await isLive(c.tiktok_username);
-          if (live) await markLive(c);
-          else await markOffline(c.creator_id);
-        } catch {}
+          if (live) {
+            await markLive(c);
+          } else {
+            await markOffline(c.creator_id);
+          }
+        } catch (err) {
+          console.error("Live check failed", c.tiktok_username);
+        }
       })
     )
   );
 }
 
-setInterval(poll, POLL_INTERVAL_SECONDS * 1000);
 poll();
+setInterval(poll, POLL_INTERVAL_SECONDS * 1000);
