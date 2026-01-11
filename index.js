@@ -1,34 +1,57 @@
 const { Pool } = require("pg");
 const { TikTokLiveConnection } = require("@adamjessop/tiktok-live-connector");
 
+/* ========= REQUIRED ENV ========= */
+
 const DATABASE_URL = process.env.DATABASE_URL;
 if (!DATABASE_URL) {
   console.error("Fatal: DATABASE_URL is not set");
   process.exit(1);
 }
 
-const POLL_INTERVAL_SECONDS = 60;
-const CONCURRENCY = 4;
-const OFFLINE_MISS_THRESHOLD = 2;
-const CREATOR_LOOKBACK_DAYS = 3;
+/* ========= CONFIG FROM RAILWAY VARIABLES ========= */
 
-// HARD LOGGING RULE:
-// Only log fatal startup issues or aggregate poll failures.
-// Never log per creator TikTok failures.
+const POLL_INTERVAL_SECONDS = Number(process.env.POLL_INTERVAL_SECONDS || 60);
+const CONCURRENCY = Number(process.env.CONCURRENCY || 2);
+const OFFLINE_MISS_THRESHOLD = Number(process.env.OFFLINE_MISS_THRESHOLD || 2);
+const CREATOR_LOOKBACK_DAYS = Number(process.env.CREATOR_LOOKBACK_DAYS || 3);
 
-function logFatal(msg) {
-  console.error(msg);
-}
-
-function logOncePerPoll(msg) {
-  console.error(msg);
-}
+/* ========= DB ========= */
 
 const pool = new Pool({
   connectionString: DATABASE_URL,
   ssl: { rejectUnauthorized: false },
   max: 5
 });
+
+/* ========= HELPERS ========= */
+
+function shuffleArray(array) {
+  for (let i = array.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [array[i], array[j]] = [array[j], array[i]];
+  }
+}
+
+async function runWithConcurrency(items, limit, worker) {
+  let index = 0;
+
+  async function next() {
+    if (index >= items.length) return;
+    const item = items[index++];
+    await worker(item);
+    await next();
+  }
+
+  const workers = [];
+  for (let i = 0; i < limit; i++) {
+    workers.push(next());
+  }
+
+  await Promise.all(workers);
+}
+
+/* ========= DATA ========= */
 
 async function getCreatorsToMonitor() {
   const sql = `
@@ -54,14 +77,17 @@ async function getCreatorsToMonitor() {
     .filter(r => r.creator_id && r.tiktok_username);
 }
 
+/* ========= TIKTOK ========= */
+
 async function isLive(username) {
   const conn = new TikTokLiveConnection(username, {
     processInitialData: false,
     fetchRoomInfoOnConnect: false
   });
-
   return Boolean(await conn.fetchIsLive());
 }
+
+/* ========= STATE ========= */
 
 async function markLive(c) {
   await pool.query(
@@ -92,7 +118,8 @@ async function markLive(c) {
     select $1, $2, now()
     where not exists (
       select 1 from live_sessions
-      where creator_id = $1 and ended_at is null
+      where creator_id = $1
+        and ended_at is null
     )
     `,
     [c.creator_id, c.tiktok_username]
@@ -120,42 +147,30 @@ async function markNotLiveCandidate(creator_id) {
     update live_sessions
     set ended_at = now(),
         updated_at = now()
-    where creator_id = $1 and ended_at is null
+    where creator_id = $1
+      and ended_at is null
     `,
     [creator_id]
   );
 
-  await pool.query(`delete from live_now where creator_id = $1`, [creator_id]);
+  await pool.query(
+    `delete from live_now where creator_id = $1`,
+    [creator_id]
+  );
 }
 
-async function runWithConcurrency(items, limit, worker) {
-  let index = 0;
-
-  async function next() {
-    if (index >= items.length) return;
-    const current = items[index++];
-    await worker(current);
-    await next();
-  }
-
-  const workers = [];
-  for (let i = 0; i < limit; i++) {
-    workers.push(next());
-  }
-
-  await Promise.all(workers);
-}
+/* ========= POLL ========= */
 
 async function pollOnce() {
   let creators;
   try {
     creators = await getCreatorsToMonitor();
-  } catch (err) {
-    logOncePerPoll("DB read failed for live poll");
+  } catch {
     return;
   }
 
-  let failedChecks = 0;
+  /* RANDOMISE ORDER EACH POLL */
+  shuffleArray(creators);
 
   await runWithConcurrency(creators, CONCURRENCY, async (c) => {
     try {
@@ -166,36 +181,26 @@ async function pollOnce() {
         await markNotLiveCandidate(c.creator_id);
       }
     } catch {
-      // TikTok failure, treat as unknown
-      failedChecks++;
+      // ignore TikTok failures
     }
   });
-
-  if (failedChecks > 0) {
-    logOncePerPoll(`Live poll completed with ${failedChecks} TikTok check failures`);
-  }
 }
+
+/* ========= BOOT ========= */
 
 async function main() {
   try {
     await pool.query("select 1");
-  } catch (err) {
-    logFatal("Fatal DB connection error");
+  } catch {
+    console.error("Fatal DB connection error");
     process.exit(1);
   }
 
   await pollOnce();
 
   setInterval(() => {
-    pollOnce().catch(() => {
-      logOncePerPoll("Unhandled poll loop failure");
-    });
+    pollOnce().catch(() => {});
   }, POLL_INTERVAL_SECONDS * 1000);
 }
-
-process.on("unhandledRejection", () => {});
-process.on("uncaughtException", () => {
-  process.exit(1);
-});
 
 main();
