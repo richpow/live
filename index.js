@@ -12,9 +12,16 @@ const CONCURRENCY = 4;
 const OFFLINE_MISS_THRESHOLD = 2;
 const CREATOR_LOOKBACK_DAYS = 3;
 
-// minimal logs only
-function logError(...args) {
-  console.error(...args);
+// HARD LOGGING RULE:
+// Only log fatal startup issues or aggregate poll failures.
+// Never log per creator TikTok failures.
+
+function logFatal(msg) {
+  console.error(msg);
+}
+
+function logOncePerPoll(msg) {
+  console.error(msg);
 }
 
 const pool = new Pool({
@@ -52,6 +59,7 @@ async function isLive(username) {
     processInitialData: false,
     fetchRoomInfoOnConnect: false
   });
+
   return Boolean(await conn.fetchIsLive());
 }
 
@@ -143,9 +151,11 @@ async function pollOnce() {
   try {
     creators = await getCreatorsToMonitor();
   } catch (err) {
-    logError("DB read error:", err.message);
+    logOncePerPoll("DB read failed for live poll");
     return;
   }
+
+  let failedChecks = 0;
 
   await runWithConcurrency(creators, CONCURRENCY, async (c) => {
     try {
@@ -155,30 +165,36 @@ async function pollOnce() {
       } else {
         await markNotLiveCandidate(c.creator_id);
       }
-    } catch (err) {
-      logError("Live check failed:", c.tiktok_username, err.message);
+    } catch {
+      // TikTok failure, treat as unknown
+      failedChecks++;
     }
   });
+
+  if (failedChecks > 0) {
+    logOncePerPoll(`Live poll completed with ${failedChecks} TikTok check failures`);
+  }
 }
 
 async function main() {
   try {
     await pool.query("select 1");
   } catch (err) {
-    logError("Fatal DB connection error:", err.message);
+    logFatal("Fatal DB connection error");
     process.exit(1);
   }
 
   await pollOnce();
 
   setInterval(() => {
-    pollOnce().catch(err => logError("Poll loop error:", err.message));
+    pollOnce().catch(() => {
+      logOncePerPoll("Unhandled poll loop failure");
+    });
   }, POLL_INTERVAL_SECONDS * 1000);
 }
 
-process.on("unhandledRejection", err => logError("Unhandled rejection:", err));
-process.on("uncaughtException", err => {
-  logError("Uncaught exception:", err.message);
+process.on("unhandledRejection", () => {});
+process.on("uncaughtException", () => {
   process.exit(1);
 });
 
