@@ -1,43 +1,22 @@
 const { Pool } = require("pg");
-const pLimit = require("p-limit");
 const { TikTokLiveConnection } = require("@adamjessop/tiktok-live-connector");
 
 const DATABASE_URL = process.env.DATABASE_URL;
 if (!DATABASE_URL) {
-  console.error("Fatal: DATABASE_URL is not set in Railway Variables");
+  console.error("Fatal: DATABASE_URL is not set");
   process.exit(1);
 }
 
-/*
-Defaults chosen for:
-  around 1300 creators
-  minimal logs
-  reduced chance of TikTok throttling
+const POLL_INTERVAL_SECONDS = 60;
+const CONCURRENCY = 4;
+const OFFLINE_MISS_THRESHOLD = 2;
+const CREATOR_LOOKBACK_DAYS = 3;
 
-You can override via Railway Variables if needed:
-  POLL_INTERVAL_SECONDS (default 60)
-  CONCURRENCY (default 4)
-  OFFLINE_MISS_THRESHOLD (default 2)
-  CREATOR_LOOKBACK_DAYS (default 3)
-*/
-
-const POLL_INTERVAL_SECONDS = Number(process.env.POLL_INTERVAL_SECONDS || 60);
-const CONCURRENCY = Number(process.env.CONCURRENCY || 4);
-const OFFLINE_MISS_THRESHOLD = Number(process.env.OFFLINE_MISS_THRESHOLD || 2);
-const CREATOR_LOOKBACK_DAYS = Number(process.env.CREATOR_LOOKBACK_DAYS || 3);
-
-// Minimal log mode, requested
-const LOG_ERRORS_ONLY = true;
-
-function logInfo(...args) {
-  if (!LOG_ERRORS_ONLY) console.log(...args);
-}
-
+// minimal logs only
 function logError(...args) {
   console.error(...args);
 }
 
-// Neon needs SSL. This works for Neon pooler connections.
 const pool = new Pool({
   connectionString: DATABASE_URL,
   ssl: { rejectUnauthorized: false },
@@ -45,7 +24,6 @@ const pool = new Pool({
 });
 
 async function getCreatorsToMonitor() {
-  // Uses fasttrack_daily only, last N days, demo data excluded
   const sql = `
     select distinct
       creator_id,
@@ -61,30 +39,23 @@ async function getCreatorsToMonitor() {
 
   const { rows } = await pool.query(sql, [CREATOR_LOOKBACK_DAYS]);
 
-  // Multiple rows per creator_id over 3 days are expected, distinct collapses them.
   return rows
-    .map((r) => ({
+    .map(r => ({
       creator_id: String(r.creator_id).trim(),
-      tiktok_username: String(r.tiktok_username || "")
-        .trim()
-        .replace(/^@/, "")
+      tiktok_username: String(r.tiktok_username).trim().replace(/^@/, "")
     }))
-    .filter((r) => r.creator_id && r.tiktok_username);
+    .filter(r => r.creator_id && r.tiktok_username);
 }
 
 async function isLive(username) {
-  // Unofficial check, can fail on some IPs. Failures are treated as unknown, not offline.
   const conn = new TikTokLiveConnection(username, {
     processInitialData: false,
     fetchRoomInfoOnConnect: false
   });
-
-  const result = await conn.fetchIsLive();
-  return Boolean(result);
+  return Boolean(await conn.fetchIsLive());
 }
 
-async function markLive(creator) {
-  // Upsert into live_now
+async function markLive(c) {
   await pool.query(
     `
     insert into live_now (
@@ -104,34 +75,29 @@ async function markLive(creator) {
       miss_count = 0,
       updated_at = now()
     `,
-    [creator.creator_id, creator.tiktok_username]
+    [c.creator_id, c.tiktok_username]
   );
 
-  // Ensure an open session exists
   await pool.query(
     `
     insert into live_sessions (creator_id, tiktok_username, started_at)
     select $1, $2, now()
     where not exists (
-      select 1
-      from live_sessions
-      where creator_id = $1
-        and ended_at is null
+      select 1 from live_sessions
+      where creator_id = $1 and ended_at is null
     )
     `,
-    [creator.creator_id, creator.tiktok_username]
+    [c.creator_id, c.tiktok_username]
   );
 }
 
 async function markNotLiveCandidate(creator_id) {
-  // Increment miss_count
   const { rows } = await pool.query(
     `
     update live_now
-    set
-      miss_count = miss_count + 1,
-      last_check_at = now(),
-      updated_at = now()
+    set miss_count = miss_count + 1,
+        last_check_at = now(),
+        updated_at = now()
     where creator_id = $1
     returning miss_count
     `,
@@ -139,28 +105,37 @@ async function markNotLiveCandidate(creator_id) {
   );
 
   if (!rows.length) return;
+  if (rows[0].miss_count < OFFLINE_MISS_THRESHOLD) return;
 
-  const missCount = Number(rows[0].miss_count || 0);
-  if (missCount < OFFLINE_MISS_THRESHOLD) return;
-
-  // Close open session
   await pool.query(
     `
     update live_sessions
     set ended_at = now(),
         updated_at = now()
-    where creator_id = $1
-      and ended_at is null
+    where creator_id = $1 and ended_at is null
     `,
     [creator_id]
   );
 
-  // Remove from live_now
   await pool.query(`delete from live_now where creator_id = $1`, [creator_id]);
 }
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+async function runWithConcurrency(items, limit, worker) {
+  let index = 0;
+
+  async function next() {
+    if (index >= items.length) return;
+    const current = items[index++];
+    await worker(current);
+    await next();
+  }
+
+  const workers = [];
+  for (let i = 0; i < limit; i++) {
+    workers.push(next());
+  }
+
+  await Promise.all(workers);
 }
 
 async function pollOnce() {
@@ -168,65 +143,43 @@ async function pollOnce() {
   try {
     creators = await getCreatorsToMonitor();
   } catch (err) {
-    logError("DB error reading creators:", String(err && err.message ? err.message : err));
+    logError("DB read error:", err.message);
     return;
   }
 
-  const limit = pLimit(CONCURRENCY);
-
-  // Stagger requests slightly to reduce burst behaviour
-  const perTaskDelayMs = Math.max(0, Math.floor(800 / Math.max(1, CONCURRENCY)));
-
-  await Promise.allSettled(
-    creators.map((c, idx) =>
-      limit(async () => {
-        if (perTaskDelayMs) await sleep(perTaskDelayMs * (idx % CONCURRENCY));
-
-        try {
-          const live = await isLive(c.tiktok_username);
-          if (live) {
-            await markLive(c);
-          } else {
-            await markNotLiveCandidate(c.creator_id);
-          }
-        } catch (err) {
-          // Do not mark offline on errors, avoids false removals when TikTok blocks
-          logError("Live check failed:", c.tiktok_username, String(err && err.message ? err.message : err));
-        }
-      })
-    )
-  );
+  await runWithConcurrency(creators, CONCURRENCY, async (c) => {
+    try {
+      const live = await isLive(c.tiktok_username);
+      if (live) {
+        await markLive(c);
+      } else {
+        await markNotLiveCandidate(c.creator_id);
+      }
+    } catch (err) {
+      logError("Live check failed:", c.tiktok_username, err.message);
+    }
+  });
 }
 
 async function main() {
-  // Connectivity check, one line only
   try {
-    await pool.query("select 1 as ok");
+    await pool.query("select 1");
   } catch (err) {
-    logError("Fatal: cannot connect to database:", String(err && err.message ? err.message : err));
+    logError("Fatal DB connection error:", err.message);
     process.exit(1);
   }
 
-  // Run loop
   await pollOnce();
 
   setInterval(() => {
-    pollOnce().catch((err) => {
-      logError("Poll loop error:", String(err && err.message ? err.message : err));
-    });
+    pollOnce().catch(err => logError("Poll loop error:", err.message));
   }, POLL_INTERVAL_SECONDS * 1000);
 }
 
-process.on("unhandledRejection", (reason) => {
-  logError("Unhandled rejection:", String(reason));
-});
-
-process.on("uncaughtException", (err) => {
-  logError("Uncaught exception:", String(err && err.message ? err.message : err));
+process.on("unhandledRejection", err => logError("Unhandled rejection:", err));
+process.on("uncaughtException", err => {
+  logError("Uncaught exception:", err.message);
   process.exit(1);
 });
 
-main().catch((err) => {
-  logError("Fatal error:", String(err && err.message ? err.message : err));
-  process.exit(1);
-});
+main();
