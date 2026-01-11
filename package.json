@@ -1,0 +1,15 @@
+{
+  "name": "fasttrack-live-poller",
+  "version": "1.0.0",
+  "private": true,
+  "type": "commonjs",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@adamjessop/tiktok-live-connector": "^2.0.0",
+    "pg": "^8.12.0",
+    "p-limit": "^4.0.0"
+  }
+}
