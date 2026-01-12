@@ -11,14 +11,8 @@ if (!DATABASE_URL) {
 
 const POLL_INTERVAL_SECONDS = Number(process.env.POLL_INTERVAL_SECONDS || 60);
 const CONCURRENCY = Number(process.env.CONCURRENCY || 3);
-const OFFLINE_MISS_THRESHOLD = Number(process.env.OFFLINE_MISS_THRESHOLD || 1);
+const OFFLINE_MISS_THRESHOLD = Number(process.env.OFFLINE_MISS_THRESHOLD || 3);
 const CREATOR_LOOKBACK_DAYS = Number(process.env.CREATOR_LOOKBACK_DAYS || 3);
-const RETRY_DELAY_MS = Number(process.env.RETRY_DELAY_MS || 5000);
-
-/* How recent they must have been live to justify retry (seconds) */
-const RECENT_LIVE_GRACE_SECONDS = Number(
-  process.env.RECENT_LIVE_GRACE_SECONDS || 90
-);
 
 /* ================= DB ================= */
 
@@ -35,10 +29,6 @@ function shuffle(array) {
     const j = Math.floor(Math.random() * (i + 1));
     [array[i], array[j]] = [array[j], array[i]];
   }
-}
-
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 async function runWithConcurrency(items, limit, fn) {
@@ -87,7 +77,7 @@ async function getCreators() {
 
 /* ================= TIKTOK ================= */
 
-async function checkIsLive(username) {
+async function isLive(username) {
   const conn = new TikTokLiveConnection(username, {
     processInitialData: false,
     fetchRoomInfoOnConnect: false
@@ -96,24 +86,6 @@ async function checkIsLive(username) {
 }
 
 /* ================= STATE ================= */
-
-async function wasSeenLiveRecently(creator_id) {
-  const { rows } = await pool.query(
-    `
-    select last_seen_live_at
-    from live_now
-    where creator_id = $1
-    `,
-    [creator_id]
-  );
-
-  if (!rows.length) return false;
-
-  const lastSeen = new Date(rows[0].last_seen_live_at).getTime();
-  const ageSeconds = (Date.now() - lastSeen) / 1000;
-
-  return ageSeconds <= RECENT_LIVE_GRACE_SECONDS;
-}
 
 async function markLive(c) {
   await pool.query(
@@ -189,28 +161,14 @@ async function markMiss(c) {
 
 async function checkCreator(c) {
   try {
-    if (await checkIsLive(c.username)) {
+    if (await isLive(c.username)) {
       await markLive(c);
-      return;
+    } else {
+      await markMiss(c);
     }
-  } catch {}
-
-  const shouldRetry = await wasSeenLiveRecently(c.creator_id);
-  if (!shouldRetry) {
-    await markMiss(c);
-    return;
+  } catch {
+    // ignore TikTok failures completely
   }
-
-  await sleep(RETRY_DELAY_MS);
-
-  try {
-    if (await checkIsLive(c.username)) {
-      await markLive(c);
-      return;
-    }
-  } catch {}
-
-  await markMiss(c);
 }
 
 async function pollOnce() {
