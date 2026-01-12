@@ -1,22 +1,21 @@
-const { Pool } = require("pg");
-const { TikTokLiveConnection } = require("@adamjessop/tiktok-live-connector");
+import { Pool } from "pg";
+import { TikTokLiveConnection } from "@adamjessop/tiktok-live-connector";
 
-/* ========= REQUIRED ENV ========= */
+/* ================= ENV ================= */
 
 const DATABASE_URL = process.env.DATABASE_URL;
 if (!DATABASE_URL) {
-  console.error("Fatal: DATABASE_URL is not set");
+  console.error("DATABASE_URL missing");
   process.exit(1);
 }
 
-/* ========= CONFIG FROM RAILWAY VARIABLES ========= */
-
 const POLL_INTERVAL_SECONDS = Number(process.env.POLL_INTERVAL_SECONDS || 60);
-const CONCURRENCY = Number(process.env.CONCURRENCY || 2);
+const CONCURRENCY = Number(process.env.CONCURRENCY || 3);
 const OFFLINE_MISS_THRESHOLD = Number(process.env.OFFLINE_MISS_THRESHOLD || 2);
 const CREATOR_LOOKBACK_DAYS = Number(process.env.CREATOR_LOOKBACK_DAYS || 3);
+const RETRY_DELAY_MS = Number(process.env.RETRY_DELAY_MS || 15000);
 
-/* ========= DB ========= */
+/* ================= DB ================= */
 
 const pool = new Pool({
   connectionString: DATABASE_URL,
@@ -24,40 +23,45 @@ const pool = new Pool({
   max: 5
 });
 
-/* ========= HELPERS ========= */
+/* ================= HELPERS ================= */
 
-function shuffleArray(array) {
+function shuffle(array) {
   for (let i = array.length - 1; i > 0; i--) {
     const j = Math.floor(Math.random() * (i + 1));
     [array[i], array[j]] = [array[j], array[i]];
   }
 }
 
-async function runWithConcurrency(items, limit, worker) {
+function sleep(ms) {
+  return new Promise(r => setTimeout(r, ms));
+}
+
+async function runWithConcurrency(items, limit, fn) {
   let index = 0;
 
-  async function next() {
-    if (index >= items.length) return;
-    const item = items[index++];
-    await worker(item);
-    await next();
+  async function worker() {
+    while (index < items.length) {
+      const item = items[index++];
+      await fn(item);
+    }
   }
 
   const workers = [];
   for (let i = 0; i < limit; i++) {
-    workers.push(next());
+    workers.push(worker());
   }
 
   await Promise.all(workers);
 }
 
-/* ========= DATA ========= */
+/* ================= DATA ================= */
 
-async function getCreatorsToMonitor() {
-  const sql = `
+async function getCreators() {
+  const { rows } = await pool.query(
+    `
     select distinct
       creator_id,
-      "Creator's username" as tiktok_username
+      "Creator's username" as username
     from fasttrack_daily
     where "Creator's username" is not null
       and "Creator's username" <> ''
@@ -65,21 +69,19 @@ async function getCreatorsToMonitor() {
       and creator_id <> ''
       and "Data period" >= (current_date - ($1::int || ' days')::interval)
       and is_demo_data is not true
-  `;
+    `,
+    [CREATOR_LOOKBACK_DAYS]
+  );
 
-  const { rows } = await pool.query(sql, [CREATOR_LOOKBACK_DAYS]);
-
-  return rows
-    .map(r => ({
-      creator_id: String(r.creator_id).trim(),
-      tiktok_username: String(r.tiktok_username).trim().replace(/^@/, "")
-    }))
-    .filter(r => r.creator_id && r.tiktok_username);
+  return rows.map(r => ({
+    creator_id: String(r.creator_id).trim(),
+    username: String(r.username).replace(/^@/, "").trim()
+  }));
 }
 
-/* ========= TIKTOK ========= */
+/* ================= TIKTOK ================= */
 
-async function isLive(username) {
+async function checkIsLive(username) {
   const conn = new TikTokLiveConnection(username, {
     processInitialData: false,
     fetchRoomInfoOnConnect: false
@@ -87,7 +89,7 @@ async function isLive(username) {
   return Boolean(await conn.fetchIsLive());
 }
 
-/* ========= STATE ========= */
+/* ================= STATE ================= */
 
 async function markLive(c) {
   await pool.query(
@@ -109,24 +111,24 @@ async function markLive(c) {
       miss_count = 0,
       updated_at = now()
     `,
-    [c.creator_id, c.tiktok_username]
+    [c.creator_id, c.username]
   );
 
   await pool.query(
     `
     insert into live_sessions (creator_id, tiktok_username, started_at)
-    select $1, $2, now()
+    select $1,$2,now()
     where not exists (
       select 1 from live_sessions
       where creator_id = $1
         and ended_at is null
     )
     `,
-    [c.creator_id, c.tiktok_username]
+    [c.creator_id, c.username]
   );
 }
 
-async function markNotLiveCandidate(creator_id) {
+async function markMiss(c) {
   const { rows } = await pool.query(
     `
     update live_now
@@ -136,7 +138,7 @@ async function markNotLiveCandidate(creator_id) {
     where creator_id = $1
     returning miss_count
     `,
-    [creator_id]
+    [c.creator_id]
   );
 
   if (!rows.length) return;
@@ -150,49 +152,57 @@ async function markNotLiveCandidate(creator_id) {
     where creator_id = $1
       and ended_at is null
     `,
-    [creator_id]
+    [c.creator_id]
   );
 
   await pool.query(
     `delete from live_now where creator_id = $1`,
-    [creator_id]
+    [c.creator_id]
   );
 }
 
-/* ========= POLL ========= */
+/* ================= CORE LOGIC ================= */
+
+async function checkCreator(c) {
+  try {
+    if (await checkIsLive(c.username)) {
+      await markLive(c);
+      return;
+    }
+  } catch {}
+
+  await sleep(RETRY_DELAY_MS);
+
+  try {
+    if (await checkIsLive(c.username)) {
+      await markLive(c);
+      return;
+    }
+  } catch {}
+
+  await markMiss(c);
+}
 
 async function pollOnce() {
   let creators;
   try {
-    creators = await getCreatorsToMonitor();
+    creators = await getCreators();
   } catch {
     return;
   }
 
-  /* RANDOMISE ORDER EACH POLL */
-  shuffleArray(creators);
+  shuffle(creators);
 
-  await runWithConcurrency(creators, CONCURRENCY, async (c) => {
-    try {
-      const live = await isLive(c.tiktok_username);
-      if (live) {
-        await markLive(c);
-      } else {
-        await markNotLiveCandidate(c.creator_id);
-      }
-    } catch {
-      // ignore TikTok failures
-    }
-  });
+  await runWithConcurrency(creators, CONCURRENCY, checkCreator);
 }
 
-/* ========= BOOT ========= */
+/* ================= BOOT ================= */
 
 async function main() {
   try {
     await pool.query("select 1");
   } catch {
-    console.error("Fatal DB connection error");
+    console.error("DB unavailable");
     process.exit(1);
   }
 
