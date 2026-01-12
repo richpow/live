@@ -1,5 +1,5 @@
-import { Pool } from "pg";
-import { TikTokLiveConnection } from "@adamjessop/tiktok-live-connector";
+const { Pool } = require("pg");
+const { TikTokLiveConnection } = require("@adamjessop/tiktok-live-connector");
 
 /* ================= ENV ================= */
 
@@ -33,15 +33,20 @@ function shuffle(array) {
 }
 
 function sleep(ms) {
-  return new Promise(r => setTimeout(r, ms));
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 async function runWithConcurrency(items, limit, fn) {
   let index = 0;
 
   async function worker() {
-    while (index < items.length) {
-      const item = items[index++];
+    while (true) {
+      let item;
+      if (index < items.length) {
+        item = items[index++];
+      } else {
+        return;
+      }
       await fn(item);
     }
   }
@@ -161,7 +166,7 @@ async function markMiss(c) {
   );
 }
 
-/* ================= CORE LOGIC ================= */
+/* ================= CORE ================= */
 
 async function checkCreator(c) {
   try {
