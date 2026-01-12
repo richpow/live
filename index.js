@@ -11,9 +11,14 @@ if (!DATABASE_URL) {
 
 const POLL_INTERVAL_SECONDS = Number(process.env.POLL_INTERVAL_SECONDS || 60);
 const CONCURRENCY = Number(process.env.CONCURRENCY || 3);
-const OFFLINE_MISS_THRESHOLD = Number(process.env.OFFLINE_MISS_THRESHOLD || 2);
+const OFFLINE_MISS_THRESHOLD = Number(process.env.OFFLINE_MISS_THRESHOLD || 1);
 const CREATOR_LOOKBACK_DAYS = Number(process.env.CREATOR_LOOKBACK_DAYS || 3);
-const RETRY_DELAY_MS = Number(process.env.RETRY_DELAY_MS || 15000);
+const RETRY_DELAY_MS = Number(process.env.RETRY_DELAY_MS || 5000);
+
+/* How recent they must have been live to justify retry (seconds) */
+const RECENT_LIVE_GRACE_SECONDS = Number(
+  process.env.RECENT_LIVE_GRACE_SECONDS || 90
+);
 
 /* ================= DB ================= */
 
@@ -41,12 +46,8 @@ async function runWithConcurrency(items, limit, fn) {
 
   async function worker() {
     while (true) {
-      let item;
-      if (index < items.length) {
-        item = items[index++];
-      } else {
-        return;
-      }
+      if (index >= items.length) return;
+      const item = items[index++];
       await fn(item);
     }
   }
@@ -95,6 +96,24 @@ async function checkIsLive(username) {
 }
 
 /* ================= STATE ================= */
+
+async function wasSeenLiveRecently(creator_id) {
+  const { rows } = await pool.query(
+    `
+    select last_seen_live_at
+    from live_now
+    where creator_id = $1
+    `,
+    [creator_id]
+  );
+
+  if (!rows.length) return false;
+
+  const lastSeen = new Date(rows[0].last_seen_live_at).getTime();
+  const ageSeconds = (Date.now() - lastSeen) / 1000;
+
+  return ageSeconds <= RECENT_LIVE_GRACE_SECONDS;
+}
 
 async function markLive(c) {
   await pool.query(
@@ -176,6 +195,12 @@ async function checkCreator(c) {
     }
   } catch {}
 
+  const shouldRetry = await wasSeenLiveRecently(c.creator_id);
+  if (!shouldRetry) {
+    await markMiss(c);
+    return;
+  }
+
   await sleep(RETRY_DELAY_MS);
 
   try {
@@ -197,7 +222,6 @@ async function pollOnce() {
   }
 
   shuffle(creators);
-
   await runWithConcurrency(creators, CONCURRENCY, checkCreator);
 }
 
