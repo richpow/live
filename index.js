@@ -9,8 +9,8 @@ if (!DATABASE_URL) {
   process.exit(1);
 }
 
-const POLL_INTERVAL_SECONDS = Number(process.env.POLL_INTERVAL_SECONDS || 60);
-const CONCURRENCY = Number(process.env.CONCURRENCY || 3);
+const POLL_INTERVAL_SECONDS = Number(process.env.POLL_INTERVAL_SECONDS || 45);
+const CONCURRENCY = Number(process.env.CONCURRENCY || 10);
 const OFFLINE_MISS_THRESHOLD = Number(process.env.OFFLINE_MISS_THRESHOLD || 3);
 const CREATOR_LOOKBACK_DAYS = Number(process.env.CREATOR_LOOKBACK_DAYS || 3);
 
@@ -43,10 +43,7 @@ async function runWithConcurrency(items, limit, fn) {
   }
 
   const workers = [];
-  for (let i = 0; i < limit; i++) {
-    workers.push(worker());
-  }
-
+  for (let i = 0; i < limit; i++) workers.push(worker());
   await Promise.all(workers);
 }
 
@@ -75,20 +72,40 @@ async function getCreators() {
   }));
 }
 
+async function purgeRemovedCreators(activeIds) {
+  if (!activeIds.length) return;
+
+  await pool.query(
+    `
+    delete from live_now
+    where creator_id <> all($1::text[])
+    `,
+    [activeIds]
+  );
+}
+
+async function cleanupStaleLives() {
+  await pool.query(`
+    delete from live_now
+    where last_check_at < now() - interval '10 minutes'
+  `);
+}
+
 /* ================= TIKTOK ================= */
 
 async function isLive(username) {
   const conn = new TikTokLiveConnection(username, {
     processInitialData: false,
-    fetchRoomInfoOnConnect: false
+    fetchRoomInfoOnConnect: true
   });
+
   return Boolean(await conn.fetchIsLive());
 }
 
 /* ================= STATE ================= */
 
 async function markLive(c) {
-  await pool.query(
+  const { rows } = await pool.query(
     `
     insert into live_now (
       creator_id,
@@ -97,18 +114,23 @@ async function markLive(c) {
       last_seen_live_at,
       last_check_at,
       miss_count,
+      live_confirmations,
       updated_at
     )
-    values ($1,$2,now(),now(),now(),0,now())
+    values ($1,$2,now(),now(),now(),0,1,now())
     on conflict (creator_id) do update set
       tiktok_username = excluded.tiktok_username,
       last_seen_live_at = now(),
       last_check_at = now(),
       miss_count = 0,
+      live_confirmations = live_now.live_confirmations + 1,
       updated_at = now()
+    returning live_confirmations
     `,
     [c.creator_id, c.username]
   );
+
+  if (rows[0].live_confirmations < 2) return;
 
   await pool.query(
     `
@@ -167,17 +189,23 @@ async function checkCreator(c) {
       await markMiss(c);
     }
   } catch {
-    // ignore TikTok failures completely
+    // ignore connector failures
   }
 }
 
 async function pollOnce() {
   let creators;
+
   try {
     creators = await getCreators();
   } catch {
     return;
   }
+
+  const activeIds = creators.map(c => c.creator_id);
+
+  await purgeRemovedCreators(activeIds);
+  await cleanupStaleLives();
 
   shuffle(creators);
   await runWithConcurrency(creators, CONCURRENCY, checkCreator);
